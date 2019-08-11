@@ -1,6 +1,6 @@
 //*----------------------------------
-//Emphebion RFID programma
-//Versie 1.0
+//Emphebion CheckLock program
+//Version 1.0
 //22-7-2019
 //-----------------------------------*
 
@@ -38,10 +38,28 @@
 // Integers for 
 
 int keyIndex = 23;                                              // starting position of Posible new keys
-bool slotKraken = false;
+bool hacking = false;
+int fails = 0;
+int successes = 0;
+int prevSuccesses = 0;
+int prevFails = 0;
+int code[4];
+int inputCode[4];
+int amount;
+int input[4];
+bool codeCheck;
+
+// Difficulty parameters
+int difficulty = 28;                      // Number of successes required
+unsigned long hackTimeout = 1000;
+unsigned long stepTimeout = 6000;
+int stepOffset = 2500;                   // Minimum wait time between steps (10s)
+int stepRange = 45;                       // Variable additional wait time between steps (up to 60*100ms = 6s)
 
 Servo lock;
 int pos = 0;
+static const int locked = 0;
+static const int unlocked = 180;
 
 //create a Serial object RFID
 SoftwareSerial RFID = SoftwareSerial(RFID_RX, 13);        // RFID object to control the read
@@ -53,13 +71,8 @@ uint8_t* buffer_end = buff + sizeof(buff);
 volatile bool rdyRFID = false;
 uint32_t rfidTag = 0;
 
-int skill = 0;
-bool hack = false;
-
 unsigned long rfidReadTimeout = 1000; // Time before another Tag can be read (1 s)
-unsigned long lockReset = 1000;    // Time before another Tag can be read (200 ms)
-unsigned long hackTimeout = 1000;
-unsigned long stepTimeout = 6000;
+unsigned long lockReset = 5000;    // Time before another Tag can be read (200 ms)
 
 unsigned long rfidReadTimer = 0;
 unsigned long lockTimer = 0;
@@ -158,8 +171,8 @@ void setup(){
   analogWrite(BUT4,LOW);
   
   lock.attach(LOCK_PIN);
-  lock.write(0);
-  Serial.println("Lock armed");
+  lock.write(180);
+  Serial.println("Lock armed and open");
 }
 
 void loop(){
@@ -168,129 +181,156 @@ void loop(){
   else{
     timer = millis();
     
-    if(rdyRFID){
+    if(hacking){
+      lockTimer = timer;
+      hacking = hackLockTick(timer);
+    }
+    else if(rdyRFID){
+      detachInterrupt(digitalPinToInterrupt(RFID_IRQ_PIN));
+      rdyRFID = false;
       lockTimer = timer;
       rfidTag = readRFIDTag(tag_buf);
-      skill = findSkill(rfidTag);
-      rdyRFID = false;
+      Serial.print("Tag = ");
+      Serial.println(rfidTag);
+      skillSelect(findSkill(rfidTag));
     }
     else{
-      if((timer - lockTimer) >= lockReset){
-  //      Serial.println("skillTimer Timeout reached");
-        lockTimer = timer;
-        skill = 10;
-        setSTATLED(0,0,0);
-        lock.write(0);
-        delay(500);
-      }
-      else{
-        switch(skill){
-          case 0:
-            //RED LED
-            setSTATLED(150,0,0);
-            lock.write(0);
-            delay(500);
-            break;
-          case 1:
-            // Has KEY
-            setSTATLED(0,150,0);
-            lock.write(180);
-            delay(500);
-            break;
-          case 2:
-            // ONKLAARMAKEN
-            setSTATLED(0,0,0);
-            if(hackLock(10)){
-              createKey(rfidTag);
-              setSTATLED(0,150,0);
-              lock.write(180);
-              delay(500);
-            }
-            else{
-              setSTATLED(150,0,0);
-              lock.write(0);
-              delay(500);
-            }
-            break;
-          default:
-            // DO NOTHING
-            setSTATLED(0,0,0);
-            lock.write(0);
-            delay(500);
-            break;
-        }
-      }
+      if(RFID.available())
+        RFID.read();
     }
+
+    if((timer - lockTimer) >= lockReset){
+//      Serial.println("skillTimer Timeout reached");
+      attachInterrupt(digitalPinToInterrupt(RFID_IRQ_PIN), rfidRead, FALLING);
+      lockTimer = timer;
+      setSTATLED(0,0,0);
+    }
+  }
+}
+
+//***************************************************************************//
+// Find Skill by Tag                                                         //
+//***************************************************************************//
+int findSkill(uint32_t tag){
+  for(int i = 0; i<24; i++){
+    if(i<5){
+      if(tag == Spelleider[i])
+        return 1;
+    }
+    if(tag == Sleutel[i])
+      return 1;
+  }
+  for(int i = 0; i<24; i++){
+    if(tag == Onklaarmaken[i])
+      return 2;
+  }
+  return 0;
+}
+
+//***************************************************************************//
+// Select skill to run                                                       //
+//***************************************************************************//
+void skillSelect(int s){
+  switch(s){
+    case 0:
+      //RED LED
+      hacking = false;
+      setSTATLED(200,0,0);
+      break;
+    case 1:
+      // Has KEY
+      hacking = false;
+      setSTATLED(0,200,0);
+      changeLockPos();
+      break;
+    case 2:
+      // ONKLAARMAKEN
+      codeCheck = false;
+      prevSuccesses = 0;
+      successes = 0;
+      prevFails = 0;
+      fails = 0;
+      hackStartLEDs();
+      setSTATLED(0,0,0);
+      hacking = true;
+      hackTimer = millis();
+      stepTimer = millis();
+      setStepTimeout();
+      resetValues(code,inputCode,input);
+      createCode(code);
+      break;
+    default:
+      // DO NOTHING
+      hacking = false;
+      setSTATLED(0,0,0);
+      break;
   }
 }
 
 //***************************************************************************//
 // Onklaarmaken skill                                                        //
 //***************************************************************************//
-bool hackLock(int difficulty){
-  hackStartLEDs();
-  int fail = 0;
-  int success = 0;
-  int prevSuccess = 0;
-  int code[4];
-  int currentCode[4];
-  int amount;
-  int input[4];
-  bool codeCheck;
-  
-  while(fail < 3 && success < difficulty){
-    hackTimer = millis();
-    stepTimer = millis();
-    stepTimeout = 100*random(50)+2000;
-    codeCheck = false;
-    prevSuccess = success;
-    resetValues(code,currentCode,input);
-    createCode(code);
-    
-    //Loop that determines the periode between inputs
-    while((millis() - stepTimer) <= stepTimeout){
-      maxInput(input,currentCode);
-      codeCheck = checkCode(code,currentCode);
-      if(codeCheck && (success <= prevSuccess)){
-        success++;
-        setGameLEDs(100,100,100,100);
-        if(success >= difficulty)
-          break;
-      }
-      else if(!codeCheck &&(success <= prevSuccess)){
-          if((millis() - hackTimer) >= hackTimeout){
-            fail++;
-            while((millis() - stepTimer) <= stepTimeout)
-              blinkGameLEDs();
-            break;
-          }
-        }
-      else if(!codeCheck){
-        success = prevSuccess;
+bool hackLockTick(unsigned long currentTime){
+  //Loop that determines the periode between inputs
+  Serial.print("currentTime = ");
+  Serial.print(currentTime);
+  Serial.print(" ; ");
+  Serial.print("stepTimer = ");
+  Serial.print(stepTimer);
+  if((currentTime - stepTimer) <= stepTimeout){
+    maxInput(input,inputCode);
+    codeCheck = checkCode(code,inputCode);
+    if(codeCheck && (successes <= prevSuccesses)){
+      successes = prevSuccesses + 1;
+      setGameLEDs(100,100,100,100);
+    }
+    // FUTURE WORK: break if inputCode can no longer match code
+    else if(!codeCheck && (successes <= prevSuccesses)){
+      if((currentTime - hackTimer) >= hackTimeout){
+        if(fails <= prevFails)
+          fails = prevFails + 1;
+        blinkGameLEDs();
       }
     }
+    else if(!codeCheck)
+      successes = prevSuccesses;
   }
-  setGameLEDs(0,0,0,0);
-  if(success >= 10){
-    return true;
+  else{
+    if(successes >= difficulty){
+      createKey(rfidTag);
+      setSTATLED(0,200,0);
+      changeLockPos();
+      setGameLEDs(0,0,0,0);
+      return false;
+    }
+    else if(fails >= 3){
+      setSTATLED(200,0,0);
+      setGameLEDs(0,0,0,0);
+      return false;
+    }
+    resetValues(code,inputCode,input);
+    createCode(code);
+    codeCheck = false;
+    prevSuccesses = successes;
+    prevFails = fails;
+    hackTimer = currentTime;
+    stepTimer = currentTime;
+    setStepTimeout();
   }
-  return false;
+  return true;
 }
 
 //***************************************************************************//
 // Functions for hack Code                                                   //
 //***************************************************************************//
 void createCode(int* c){
-  int amount = random(1,2);
-  for(int i = 1; i<=amount; i++){
-    int temp = random(3);
-    c[temp] = 1;
-  }
+  int temp = random(3);
+  c[temp] = 1;
   setGameLEDs(100*c[0],100*c[1],100*c[2],100*c[3]);
 }
 
 void resetValues(int* c, int* cc, int* in){
-    for(int i = 0; i<4; i++){
+    for(int i = 0; i<=3; i++){
       c[i] = 0;
       cc[i] = 0;
       in[i] = 0;
@@ -300,17 +340,29 @@ void resetValues(int* c, int* cc, int* in){
 bool checkCode(int* c, int* cc){
   bool check = true;
   for(int i = 0; i<=3; i++){
-    if(c[i] != cc[i]){
+    if(c[i] != cc[i])
       check = false;
-    }
   }
   return check;
 }
 
 void createKey(uint32_t tag){
-  Serial.println("TODO: Check function");
   Sleutel[keyIndex] = tag;
   keyIndex--;
+}
+
+void setStepTimeout(){
+  stepTimeout = 100*random(stepRange)+stepOffset;
+}
+
+void changeLockPos(){
+  if(pos == locked)
+    pos = unlocked;
+  else
+    pos = locked;
+
+  lock.write(pos);
+  delay(500);
 }
 
 //***************************************************************************//
@@ -324,51 +376,6 @@ void maxInput(int* data, int* c){
       c[i] = 1;
     }
   }
-}
-
-//***************************************************************************//
-// Set LED Functions                                                         //
-//***************************************************************************//
-void setSTATLED(int r, int g, int b){
-  digitalWrite(STAT_LED_RED,r);
-  digitalWrite(STAT_LED_GREEN,g);
-  digitalWrite(STAT_LED_BLUE,b);
-}
-
-void setGameLEDs(int n1, int n2, int n3, int n4){
-  digitalWrite(GAME_LED1,n1);
-  digitalWrite(GAME_LED2,n2);
-  digitalWrite(GAME_LED3,n3);
-  digitalWrite(GAME_LED4,n4);
-}
-
-void blinkGameLEDs(){
-  setGameLEDs(100,100,100,100);
-  delay(100);
-  setGameLEDs(0,0,0,0);
-  delay(100);
-}
-
-void hackStartLEDs(){
-  setGameLEDs(100,100,100,100);
-  delay(100);
-  setGameLEDs(0,0,0,0);  
-}
-//***************************************************************************//
-// Find Skill by Tag                                                         //
-//***************************************************************************//
-int findSkill(uint32_t tag){
-  for(int i = 0; i<24; i++){
-    if(i<5){
-      if(tag == Spelleider[i])
-        return 1;
-    }
-    if(tag == Sleutel[i])
-      return 1;
-    if(tag == Onklaarmaken[i])
-      return 2;
-  }
-  return 0;
 }
 
 //***************************************************************************//
@@ -447,12 +454,49 @@ uint8_t rfidGetNext(void)
 void rfidRead(void){
   // Lees alleen een waarde als er niet nog een verwerkt word
   if ( !rdyRFID ){
-    Serial.println("Interrupt");
+//    Serial.println("Interrupt");
     rfidReadTimer = millis();
     rdyRFID = true;                            // Zet de rdyRFID flag
   }
+  else
+    RFID.flush();
 }
 
+//***************************************************************************//
+// Set LED Functions                                                         //
+//***************************************************************************//
+void setSTATLED(int r, int g, int b){
+  digitalWrite(STAT_LED_RED,r);
+  digitalWrite(STAT_LED_GREEN,g);
+  digitalWrite(STAT_LED_BLUE,b);
+}
+
+void setGameLEDs(int n1, int n2, int n3, int n4){
+  digitalWrite(GAME_LED1,n1);
+  digitalWrite(GAME_LED2,n2);
+  digitalWrite(GAME_LED3,n3);
+  digitalWrite(GAME_LED4,n4);
+}
+
+void blinkGameLEDs(){
+  setGameLEDs(100,100,100,100);
+  delay(100);
+  setGameLEDs(0,0,0,0);
+  delay(100);
+}
+
+void hackStartLEDs(){
+  for(int i = 0; i<3; i++){
+    setGameLEDs(100,100,100,100);
+    delay(200);
+    setGameLEDs(0,0,0,0);
+    delay(800);
+  }
+}
+
+//***************************************************************************//
+// DEBUG MODE                                                                //
+//***************************************************************************//
 void debugMode(){
   int b1 = analogRead(BUT1);
   int b2 = analogRead(BUT2);
@@ -483,10 +527,10 @@ void debugMode(){
   else
     digitalWrite(GAME_LED4,0);
 
-//  lock.write(180);
-//  delay(1000);
-//  lock.write(0);
-//  delay(1000);
+  lock.write(180);
+  delay(3000);
+  lock.write(0);
+  delay(3000);
 
   if(rdyRFID){
     Serial.print("Tag found: ");
